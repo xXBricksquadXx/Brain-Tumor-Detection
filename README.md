@@ -1,17 +1,59 @@
-# Brain Tumor Detector
-Given CT scan, identify if the scan contains a brain tumor. This project is outlined by 5 steps: data input, preprocessing steps, classification algorithm architecture, and the results.
-## (1) Data Input
-The data input consists of 1000 CT scans, 500 of which contain brain tumors and the remaining 500 that do not contain tumors. These 1000 images were used to train a convolutional neural network.
-## (2) Preprocessing
-Two main steps were taken to preprocess and simplify the output of the data and reduce the training/run time of the algorithm.
-### Varying sizes of CT scans
-Using Matplotlib, the maximum size of the images was found and all CT scans were superimposed onto a canvas of that size. This way, the CT scan size is standardized. 
-### Varying color of CT scan
-The colors were removed from the CT scan as sources had varying colors. Removal of the RGB layer enabled the usage of only the black/white layer of the image to further simplify the input for the algorithm.
-## (3) Classification Algorithm
-Evaluated varying performance of CNN, KNN, and RNN architectures in tumor detection
-## (4) Results
-Discovered KNN performed best with 84.1% true positive & 72.7% of true negative accuracy.
+# Brain Tumor Detector (v2)
 
-## (5) Future Improvements
-Evaluate the layers of the KNN architecture and determine which activation functions and training/validation splits work optimally. Furthermore, investigate a neural network that can handle varying image sizes and colors as important information may have been lost in the simplification process.
+Educational / research prototype for **binary classification** of brain scan images:
+
+- `1` = tumor (folder: `yes/`)
+- `0` = no tumor (folder: `no/`)
+
+This repo is **not medical advice** and is **not validated for clinical use**.
+
+## What’s new in v2
+
+- Stable splitting and evaluation:
+  - stratified train/val/test split
+  - **larger default val split** (`--val-size 0.30`) to reduce noisy threshold tuning
+- Cleaner training/eval script (`brain_tumor_detector_v2.py`)
+  - evaluates confusion matrices at **0.50** and at the **chosen threshold**
+  - if `--threshold` is omitted, auto-picks a threshold using validation balanced accuracy
+- Plot outputs
+  - `accuracy.png`, `auc.png`, `loss.png`
+  - `roc.png`, `pr.png`
+
+## Dataset layout
+
+Place your dataset here (not committed to git):
+
+**brain_tumor_dataset/**
+
+- yes/
+  _.png / _.jpg / ...
+- no/
+  _.png / _.jpg / ...
+
+  > Notes:
+
+- Images are loaded as grayscale and padded/resized deterministically.
+- `all/` is ignored if present.
+
+## Quickstart (Windows PowerShell)
+
+Create venv + install deps:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -U pip
+pip install tensorflow scikit-learn matplotlib pillow
+```
+
+> Run baseline + save plots:
+
+```
+python brain_tumor_detector_v2.py --save-plots
+```
+
+> Run with a specific decision threshold:
+
+```
+python brain_tumor_detector_v2.py --threshold 0.60 --save-plots
+```
