@@ -1,59 +1,87 @@
 # Brain Tumor Detector (v2)
 
-Educational / research prototype for **binary classification** of brain scan images:
+Binary image classifier (tumor vs no-tumor) using a simple folder dataset:
 
-- `1` = tumor (folder: `yes/`)
-- `0` = no tumor (folder: `no/`)
+```
+brain_tumor_dataset/
+  yes/   # tumor images
+  no/    # non-tumor images
+  all/   # optional; ignored
+```
 
-This repo is **not medical advice** and is **not validated for clinical use**.
+## What this repo contains
 
-## What’s new in v2
+- `brain_tumor_detector_v2.py`: baseline trainer + evaluation script
+- Supports:
+  - **Custom CNN** on grayscale images
+  - **MobileNetV2 transfer learning** (recommended baseline)
+  - Optional **two-phase fine-tuning** for MobileNetV2
+  - **Threshold policies** (balanced accuracy or sensitivity-first “hospital-style”)
+  - Saved plots: training curves + ROC + Precision/Recall
 
-- Stable splitting and evaluation:
-  - stratified train/val/test split
-  - **larger default val split** (`--val-size 0.30`) to reduce noisy threshold tuning
-- Cleaner training/eval script (`brain_tumor_detector_v2.py`)
-  - evaluates confusion matrices at **0.50** and at the **chosen threshold**
-  - if `--threshold` is omitted, auto-picks a threshold using validation balanced accuracy
-- Plot outputs
-  - `accuracy.png`, `auc.png`, `loss.png`
-  - `roc.png`, `pr.png`
+> Not a medical device. This is an educational ML project. Do not use for clinical decisions.
 
-## Dataset layout
+## Setup
 
-Place your dataset here (not committed to git):
+Create a venv and install deps:
 
-**brain_tumor_dataset/**
-
-- yes/
-  _.png / _.jpg / ...
-- no/
-  _.png / _.jpg / ...
-
-  > Notes:
-
-- Images are loaded as grayscale and padded/resized deterministically.
-- `all/` is ignored if present.
-
-## Quickstart (Windows PowerShell)
-
-Create venv + install deps:
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\activate
+
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+
 pip install -U pip
-pip install tensorflow scikit-learn matplotlib pillow
+pip install tensorflow pillow numpy matplotlib scikit-learn
 ```
 
-> Run baseline + save plots:
+## Usage
 
-```
+### 1) Baseline (custom CNN)
+
+```bash
 python brain_tumor_detector_v2.py --save-plots
 ```
 
-> Run with a specific decision threshold:
+### 2) Transfer learning (MobileNetV2)
 
+```bash
+python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --save-plots
 ```
-python brain_tumor_detector_v2.py --threshold 0.60 --save-plots
+
+MobileNetV2 automatically switches image size to **224x224** unless you override `--img-h/--img-w`.
+
+### 3) “Hospital-style” thresholding (sensitivity-first)
+
+Chooses a threshold on the validation set that **keeps recall(class=1) >= target**, and then maximizes specificity.
+
+```bash
+python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --save-plots \
+  --threshold-policy min_recall --target-recall 0.95 --monitor val_pr_auc
 ```
+
+### 4) Two-phase fine-tune (MobileNetV2)
+
+```bash
+python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --fine-tune \
+  --head-epochs 12 --ft-epochs 20 --ft-lr 1e-4 --unfreeze-last 40 \
+  --monitor val_pr_auc --save-plots
+```
+
+## What gets printed
+
+- Dataset split sizes + class balance
+- Model summary
+- Threshold-free evaluation: **loss / accuracy (0.50 threshold) / ROC-AUC / PR-AUC**
+- Confusion matrices and metrics @ **0.50** and @ **chosen threshold**
+  - acc
+  - sensitivity / recall for tumor class (class 1)
+  - specificity / recall for no-tumor class (class 0)
+- Classification report at chosen threshold
+
+## Common next upgrades
+
+- Swap to a larger dataset (e.g., a Kaggle “brain tumor MRI/CT” dataset) and re-run the same script
+- Add k-fold cross validation or repeated splits (small datasets are high-variance)
+- Calibrate probabilities (temperature scaling) before locking a clinical-style threshold
+- Add Grad-CAM / saliency maps for qualitative sanity checks
