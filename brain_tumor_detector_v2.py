@@ -9,11 +9,14 @@ Binary classifier (tumor vs no-tumor) using folder structure:
     all/   (optional; ignored)
 
 Key features:
-- Stratified train/val/test split with larger default val split (val-size=0.30).
-- Pylance-friendly imports (avoid `from tensorflow.keras import ...`).
-- Prints confusion matrices at BOTH thresholds: 0.50 and chosen threshold.
-- If --threshold is omitted, picks threshold from validation set using balanced accuracy,
-  skipping degenerate thresholds (all-0 / all-1).
+- Stratified train/val/test split (val-size is fraction of TRAIN split).
+- Pylance-friendly imports.
+- Prints confusion matrices + accuracy/sensitivity/specificity at:
+    - threshold 0.50
+    - chosen threshold (auto-picked or user-specified)
+- If --threshold is omitted:
+    - threshold-policy=balanced_acc: pick threshold maximizing balanced accuracy on val
+    - threshold-policy=min_recall: pick threshold meeting target recall on val, then max specificity
 - Saves training curves + ROC + PR curves when --save-plots is used.
 - Optional transfer learning (MobileNetV2) + optional two-phase fine-tune:
   Phase 1: frozen backbone (train head)
@@ -26,8 +29,14 @@ Examples:
 
   python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --save-plots
 
+  # hospital-style thresholding (min recall on val, then max specificity):
+  python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --save-plots \
+    --threshold-policy min_recall --target-recall 0.95
+
+  # fine-tune with smoothing + weight decay (recommended if you fine-tune on small data):
   python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --fine-tune \
-    --head-epochs 12 --ft-epochs 20 --ft-lr 1e-4 --unfreeze-last 40 --save-plots
+    --head-epochs 12 --ft-epochs 10 --ft-lr 5e-5 --unfreeze-last 10 \
+    --label-smoothing 0.05 --weight-decay 1e-4 --monitor val_pr_auc --save-plots
 """
 
 from __future__ import annotations
@@ -82,11 +91,11 @@ def parse_args() -> argparse.Namespace:
                    help="Enable two-phase fine-tuning (MobileNetV2 backbone only)")
     p.add_argument("--head-epochs", type=int, default=12,
                    help="Phase 1 epochs (frozen backbone; head training)")
-    p.add_argument("--ft-epochs", type=int, default=20,
+    p.add_argument("--ft-epochs", type=int, default=10,
                    help="Phase 2 epochs (partial unfreeze; fine-tuning)")
-    p.add_argument("--ft-lr", type=float, default=1e-4,
+    p.add_argument("--ft-lr", type=float, default=5e-5,
                    help="Phase 2 learning rate (fine-tuning)")
-    p.add_argument("--unfreeze-last", type=int, default=40,
+    p.add_argument("--unfreeze-last", type=int, default=10,
                    help="How many backbone layers to unfreeze in phase 2 (BatchNorm stays frozen)")
 
     p.add_argument("--model-out", type=str, default="model.keras", help="Path to save best model")
@@ -97,6 +106,14 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--threshold", type=float, default=None,
                    help="Decision threshold for class=1. If omitted, pick from validation set.")
+
+    # threshold selection policies
+    p.add_argument("--threshold-policy", type=str, default="balanced_acc",
+                   choices=["balanced_acc", "min_recall"],
+                   help="How to auto-pick threshold from validation set when --threshold is omitted.")
+    p.add_argument("--target-recall", type=float, default=0.95,
+                   help="Used when threshold-policy=min_recall. Target recall on validation set for class=1.")
+
     p.add_argument("--use-class-weights", action="store_true",
                    help="Apply class weights computed from training labels (often not needed here).")
 
@@ -108,6 +125,17 @@ def parse_args() -> argparse.Namespace:
                    help="Backbone weights. 'imagenet' downloads pretrained weights; 'none' initializes randomly.")
     p.add_argument("--augment", action="store_true",
                    help="Enable lightweight augmentation (recommended for transfer learning).")
+
+    # regularization / calibration helpers
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Binary cross-entropy label smoothing (e.g., 0.05 helps reduce overconfidence).")
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="AdamW weight decay (e.g., 1e-4). Uses AdamW if available; else falls back to Adam.")
+
+    # callback monitoring metric
+    p.add_argument("--monitor", type=str, default="val_auc",
+                   choices=["val_auc", "val_pr_auc"],
+                   help="Metric to monitor for early stopping / checkpointing.")
 
     return p.parse_args()
 
@@ -178,15 +206,31 @@ def make_splits(
     return (X_train, y_train), (X_val, y_val), (X_test, y_test)
 
 
-def compile_binary(model: keras.Model, lr: float) -> None:
+def make_optimizer(lr: float, weight_decay: float) -> keras.optimizers.Optimizer:
+    if weight_decay and weight_decay > 0:
+        # Prefer AdamW if available (TF/Keras version dependent)
+        if hasattr(keras.optimizers, "AdamW"):
+            return keras.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay)
+        # Fallback: Adam (no decay)
+        return keras.optimizers.Adam(learning_rate=lr)
+    return keras.optimizers.Adam(learning_rate=lr)
+
+
+def compile_binary(model: keras.Model, lr: float, label_smoothing: float, weight_decay: float) -> None:
+    loss = keras.losses.BinaryCrossentropy(label_smoothing=float(label_smoothing))
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss="binary_crossentropy",
-        metrics=["accuracy", keras.metrics.AUC(name="auc")],
+        optimizer=make_optimizer(lr, weight_decay),
+        loss=loss,
+        # Note: "accuracy" here is threshold=0.5. Keep it, but rely on AUC/PR-AUC + printed thresholded metrics.
+        metrics=[
+            "accuracy",
+            keras.metrics.AUC(name="auc", curve="ROC"),
+            keras.metrics.AUC(name="pr_auc", curve="PR"),
+        ],
     )
 
 
-def build_model_custom(img_h: int, img_w: int, lr: float, augment: bool) -> keras.Model:
+def build_model_custom(img_h: int, img_w: int, lr: float, augment: bool, label_smoothing: float, weight_decay: float) -> keras.Model:
     L = keras.layers
 
     aug = keras.Sequential([
@@ -210,7 +254,7 @@ def build_model_custom(img_h: int, img_w: int, lr: float, augment: bool) -> kera
     outputs = L.Dense(1, activation="sigmoid")(x)
 
     model = keras.Model(inputs, outputs, name="custom_cnn")
-    compile_binary(model, lr)
+    compile_binary(model, lr, label_smoothing, weight_decay)
     return model
 
 
@@ -220,6 +264,8 @@ def build_model_mobilenetv2(
     lr: float,
     weights: str,
     augment: bool,
+    label_smoothing: float,
+    weight_decay: float,
 ) -> Tuple[keras.Model, keras.Model]:
     """
     Returns: (full_model, backbone_model)
@@ -235,7 +281,7 @@ def build_model_mobilenetv2(
     inputs = keras.Input(shape=(img_h, img_w, 3))
     x = inputs
 
-    # MobileNetV2 expects inputs roughly in [-1, 1]
+    # X is [0,1] from loader; map to [-1,1] for MobileNetV2
     x = L.Rescaling(2.0, offset=-1.0)(x)
 
     if aug is not None:
@@ -254,14 +300,11 @@ def build_model_mobilenetv2(
     outputs = L.Dense(1, activation="sigmoid")(x)
 
     model = keras.Model(inputs, outputs, name="mobilenetv2_head")
-    compile_binary(model, lr)
+    compile_binary(model, lr, label_smoothing, weight_decay)
     return model, backbone
 
 
-def unfreeze_backbone_for_finetune(
-    backbone: keras.Model,
-    unfreeze_last: int,
-) -> None:
+def unfreeze_backbone_for_finetune(backbone: keras.Model, unfreeze_last: int) -> None:
     """
     Unfreeze last N layers of backbone for fine-tuning, but keep BatchNorm layers frozen.
     """
@@ -271,25 +314,9 @@ def unfreeze_backbone_for_finetune(
         for layer in backbone.layers[:-unfreeze_last]:
             layer.trainable = False
 
-    # Always freeze BatchNorm for small datasets (stability)
     for layer in backbone.layers:
         if isinstance(layer, keras.layers.BatchNormalization):
             layer.trainable = False
-
-
-def pick_threshold(y_true: np.ndarray, probs: np.ndarray) -> float:
-    best_t, best_score = 0.5, -1.0
-    for t in np.linspace(0.05, 0.95, 181):
-        preds = (probs >= t).astype(int)
-        if preds.min() == preds.max():
-            continue
-        score = balanced_accuracy_score(y_true, preds)
-        if score > best_score:
-            best_score, best_t = score, float(t)
-
-    if best_score < 0:
-        return 0.5
-    return best_t
 
 
 def compute_class_weights(y_train: np.ndarray) -> Dict[int, float]:
@@ -302,7 +329,72 @@ def compute_class_weights(y_train: np.ndarray) -> Dict[int, float]:
     return {0: float(w0), 1: float(w1)}
 
 
-def plot_and_maybe_save_or_show(fig_name: str, save_plots: bool):
+def pick_threshold_balanced_acc(y_true: np.ndarray, probs: np.ndarray) -> float:
+    best_t, best_score = 0.5, -1.0
+    for t in np.linspace(0.05, 0.95, 181):
+        preds = (probs >= t).astype(int)
+        if preds.min() == preds.max():
+            continue
+        score = balanced_accuracy_score(y_true, preds)
+        if score > best_score:
+            best_score, best_t = score, float(t)
+    return 0.5 if best_score < 0 else best_t
+
+
+def pick_threshold_min_recall(y_true: np.ndarray, probs: np.ndarray, target_recall: float) -> float:
+    """
+    Hospital-style: find thresholds where recall >= target_recall, then pick the one
+    with the highest specificity (ties broken by higher threshold).
+    """
+    best_t = None
+    best_spec = -1.0
+
+    y_true = y_true.astype(int)
+
+    for t in np.linspace(0.05, 0.95, 181):
+        preds = (probs >= t).astype(int)
+        if preds.min() == preds.max():
+            continue
+
+        tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+        recall = tp / max(tp + fn, 1)
+        spec = tn / max(tn + fp, 1)
+
+        if recall >= target_recall:
+            if (spec > best_spec) or (spec == best_spec and (best_t is None or t > best_t)):
+                best_spec = spec
+                best_t = float(t)
+
+    if best_t is not None:
+        return best_t
+
+    # If target not reachable, fall back to balanced accuracy
+    return pick_threshold_balanced_acc(y_true, probs)
+
+
+def metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
+    tn, fp, fn, tp = cm.ravel()
+    acc = (tn + tp) / max((tn + fp + fn + tp), 1)
+    sens = tp / max((tp + fn), 1)  # recall for class 1
+    spec = tn / max((tn + fp), 1)  # recall for class 0
+    return {"acc": float(acc), "sens": float(sens), "spec": float(spec)}
+
+
+def print_threshold_block(split_name: str, y_true: np.ndarray, probs: np.ndarray, thr: float) -> None:
+    y_true_i = y_true.astype(int)
+
+    for t in [0.50, float(thr)]:
+        preds = (probs >= t).astype(int)
+        cm = confusion_matrix(y_true_i, preds)
+        m = metrics_from_cm(cm)
+
+        tag = f"@{t:.2f}"
+        print(f"\n{split_name} Confusion Matrix {tag} (rows=true, cols=pred):")
+        print(cm)
+        print(f"{split_name} metrics {tag}: acc={m['acc']:.4f} sens(recall1)={m['sens']:.4f} spec(recall0)={m['spec']:.4f}")
+
+
+def plot_and_maybe_save_or_show(fig_name: str, save_plots: bool) -> None:
     if save_plots:
         plt.savefig(fig_name, dpi=150, bbox_inches="tight")
         plt.close()
@@ -318,6 +410,13 @@ def merge_histories(h1: keras.callbacks.History, h2: Optional[keras.callbacks.Hi
         merged.setdefault(k, [])
         merged[k].extend(list(v))
     return merged
+
+
+def make_callbacks(model_out: str, monitor: str) -> List[keras.callbacks.Callback]:
+    return [
+        keras.callbacks.EarlyStopping(monitor=monitor, mode="max", patience=6, restore_best_weights=True),
+        keras.callbacks.ModelCheckpoint(model_out, monitor=monitor, mode="max", save_best_only=True),
+    ]
 
 
 def main():
@@ -349,12 +448,14 @@ def main():
 
     backbone = None
     if args.backbone == "custom":
-        model = build_model_custom(args.img_h, args.img_w, args.lr, augment=args.augment)
+        model = build_model_custom(args.img_h, args.img_w, args.lr, args.augment, args.label_smoothing, args.weight_decay)
     else:
         model, backbone = build_model_mobilenetv2(
             args.img_h, args.img_w, args.lr,
             weights=args.backbone_weights,
             augment=args.augment,
+            label_smoothing=args.label_smoothing,
+            weight_decay=args.weight_decay,
         )
 
     model.summary()
@@ -364,101 +465,83 @@ def main():
         class_weight = compute_class_weights(y_train)
         print(f"Using class weights: {class_weight}")
 
-    # -------------------------
-    # Training (single-stage OR two-phase)
-    # -------------------------
     history2 = None
 
     if args.fine_tune and args.backbone == "mobilenetv2":
-        # Phase 1: head training (frozen backbone)
-        callbacks1 = [
-            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=6, restore_best_weights=True),
-            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
-        ]
         print(f"\n[Phase 1] Frozen backbone head training: epochs={args.head_epochs}, lr={args.lr}")
         history1 = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=args.head_epochs,
             batch_size=args.batch_size,
-            callbacks=callbacks1,
+            callbacks=make_callbacks(args.model_out, args.monitor),
             class_weight=class_weight,
             verbose=1,
         )
 
-        # Phase 2: fine-tuning (partial unfreeze + lower LR)
         assert backbone is not None
         unfreeze_backbone_for_finetune(backbone, args.unfreeze_last)
-        compile_binary(model, args.ft_lr)
 
-        callbacks2 = [
-            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=5, restore_best_weights=True),
-            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
-        ]
+        # Re-compile with fine-tune LR (keep smoothing/decay)
+        compile_binary(model, args.ft_lr, args.label_smoothing, args.weight_decay)
+
         print(f"\n[Phase 2] Fine-tune: epochs={args.ft_epochs}, ft_lr={args.ft_lr}, unfreeze_last={args.unfreeze_last}")
         history2 = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=args.ft_epochs,
             batch_size=args.batch_size,
-            callbacks=callbacks2,
+            callbacks=make_callbacks(args.model_out, args.monitor),
             class_weight=class_weight,
             verbose=1,
         )
+
         history = type("MergedHistory", (), {"history": merge_histories(history1, history2)})()
     else:
-        callbacks = [
-            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=7, restore_best_weights=True),
-            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
-        ]
         history = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
             epochs=args.epochs,
             batch_size=args.batch_size,
-            callbacks=callbacks,
+            callbacks=make_callbacks(args.model_out, args.monitor),
             class_weight=class_weight,
             verbose=1,
         )
 
-    # -------------------------
-    # Evaluation
-    # -------------------------
-    test_loss, test_acc, test_auc = model.evaluate(X_test, y_test, verbose=0)
+    # Force evaluation on the checkpointed "best" model file for consistency
+    best_path = Path(args.model_out)
+    if best_path.exists():
+        model = keras.models.load_model(best_path)
+
+    test_loss, test_acc, test_auc, test_pr_auc = model.evaluate(X_test, y_test, verbose=0)
     print(f"\nTest loss: {test_loss:.4f}")
-    print(f"Test acc : {test_acc:.4f}")
+    print(f"Test acc : {test_acc:.4f}  (threshold=0.50)")
     print(f"Test auc : {test_auc:.4f}")
-    print(f"Saved best model to: {Path(args.model_out).resolve()}")
+    print(f"Test pr_auc: {test_pr_auc:.4f}")
+    print(f"Saved best model to: {best_path.resolve()}")
 
     val_probs = model.predict(X_val, verbose=0).reshape(-1)
     print("\nVal prob stats:", f"min={val_probs.min():.3f} mean={val_probs.mean():.3f} max={val_probs.max():.3f}")
 
     if args.threshold is None:
-        thr = pick_threshold(y_val.astype(int), val_probs)
-        print(f"Picked threshold from val: {thr:.2f}")
+        if args.threshold_policy == "balanced_acc":
+            thr = pick_threshold_balanced_acc(y_val.astype(int), val_probs)
+            print(f"Picked threshold from val (balanced_acc): {thr:.2f}")
+        else:
+            thr = pick_threshold_min_recall(y_val.astype(int), val_probs, target_recall=float(args.target_recall))
+            print(f"Picked threshold from val (min_recall target={args.target_recall:.2f}): {thr:.2f}")
     else:
         thr = float(args.threshold)
         print(f"Using user threshold: {thr:.2f}")
 
-    val_preds_05 = (val_probs >= 0.5).astype(int)
-    val_preds_thr = (val_probs >= thr).astype(int)
-
-    print("\nVal Confusion Matrix @0.50 (rows=true, cols=pred):")
-    print(confusion_matrix(y_val.astype(int), val_preds_05))
-    print(f"\nVal Confusion Matrix @{thr:.2f} (rows=true, cols=pred):")
-    print(confusion_matrix(y_val.astype(int), val_preds_thr))
+    print_threshold_block("Val", y_val, val_probs, thr)
 
     test_probs = model.predict(X_test, verbose=0).reshape(-1)
-    print("Test prob stats:", f"min={test_probs.min():.3f} mean={test_probs.mean():.3f} max={test_probs.max():.3f}")
+    print("\nTest prob stats:", f"min={test_probs.min():.3f} mean={test_probs.mean():.3f} max={test_probs.max():.3f}")
 
-    test_preds_05 = (test_probs >= 0.5).astype(int)
-    test_preds_thr = (test_probs >= thr).astype(int)
+    print_threshold_block("Test", y_test, test_probs, thr)
 
-    print("\nTest Confusion Matrix @0.50 (rows=true, cols=pred):")
-    print(confusion_matrix(y_test.astype(int), test_preds_05))
-    print(f"\nTest Confusion Matrix @{thr:.2f} (rows=true, cols=pred):")
-    print(confusion_matrix(y_test.astype(int), test_preds_thr))
-
+    test_preds_thr = (test_probs >= float(thr)).astype(int)
     print(f"\nClassification Report @{thr:.2f}:")
     print(classification_report(y_test.astype(int), test_preds_thr, digits=4, zero_division=0))
 
@@ -497,7 +580,7 @@ def main():
         plt.figure()
         plt.plot(h.get("accuracy", []), label="train")
         plt.plot(h.get("val_accuracy", []), label="val")
-        plt.title("Accuracy")
+        plt.title("Accuracy (threshold=0.50)")
         plt.xlabel("epoch")
         plt.ylabel("accuracy")
         plt.legend()
@@ -506,11 +589,20 @@ def main():
         plt.figure()
         plt.plot(h.get("auc", []), label="train")
         plt.plot(h.get("val_auc", []), label="val")
-        plt.title("AUC")
+        plt.title("ROC AUC")
         plt.xlabel("epoch")
         plt.ylabel("auc")
         plt.legend()
         plot_and_maybe_save_or_show("auc.png", args.save_plots)
+
+        plt.figure()
+        plt.plot(h.get("pr_auc", []), label="train")
+        plt.plot(h.get("val_pr_auc", []), label="val")
+        plt.title("PR AUC")
+        plt.xlabel("epoch")
+        plt.ylabel("pr_auc")
+        plt.legend()
+        plot_and_maybe_save_or_show("pr_auc.png", args.save_plots)
 
         plt.figure()
         plt.plot(h.get("loss", []), label="train")
