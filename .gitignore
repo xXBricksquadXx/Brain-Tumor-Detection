@@ -2,3 +2,4 @@
 __pycache__/
 *.keras
 *.png
+brain_tumor_dataset/
