@@ -9,18 +9,25 @@ Binary classifier (tumor vs no-tumor) using folder structure:
     all/   (optional; ignored)
 
 Key features:
-- Larger default validation split (val-size=0.30) for more stable threshold selection.
-- Avoids `from tensorflow.keras import ...` to reduce Pylance resolution issues.
-- Evaluates at BOTH thresholds: 0.50 and chosen threshold.
-- If --threshold is omitted, picks a threshold from validation set (balanced accuracy),
+- Stratified train/val/test split with larger default val split (val-size=0.30).
+- Pylance-friendly imports (avoid `from tensorflow.keras import ...`).
+- Prints confusion matrices at BOTH thresholds: 0.50 and chosen threshold.
+- If --threshold is omitted, picks threshold from validation set using balanced accuracy,
   skipping degenerate thresholds (all-0 / all-1).
-- Saves training curves (accuracy/auc/loss) + ROC + PR curves when --save-plots is used.
-- Optional transfer learning backbone: MobileNetV2 (requires 3-channel inputs).
+- Saves training curves + ROC + PR curves when --save-plots is used.
+- Optional transfer learning (MobileNetV2) + optional two-phase fine-tune:
+  Phase 1: frozen backbone (train head)
+  Phase 2: unfreeze last N layers (keep BatchNorm frozen) + lower LR
 
-Run:
+Examples:
   python brain_tumor_detector_v2.py --save-plots
+
   python brain_tumor_detector_v2.py --threshold 0.60 --save-plots
-  python brain_tumor_detector_v2.py --backbone mobilenetv2 --img-h 224 --img-w 224 --save-plots
+
+  python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --save-plots
+
+  python brain_tumor_detector_v2.py --backbone mobilenetv2 --augment --fine-tune \
+    --head-epochs 12 --ft-epochs 20 --ft-lr 1e-4 --unfreeze-last 40 --save-plots
 """
 
 from __future__ import annotations
@@ -62,13 +69,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img-w", type=int, default=240, help="Image width")
 
     p.add_argument("--test-size", type=float, default=0.33, help="Test split fraction")
-    # Larger default validation split for stability
     p.add_argument("--val-size", type=float, default=0.30, help="Val fraction of TRAIN split")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    p.add_argument("--epochs", type=int, default=50, help="Max epochs")
+    # Single-stage training (custom CNN or frozen TL if not using fine-tune)
+    p.add_argument("--epochs", type=int, default=50, help="Max epochs (single-stage mode)")
     p.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate (single-stage OR head stage)")
+
+    # Two-phase fine-tune options (MobileNetV2 only)
+    p.add_argument("--fine-tune", action="store_true",
+                   help="Enable two-phase fine-tuning (MobileNetV2 backbone only)")
+    p.add_argument("--head-epochs", type=int, default=12,
+                   help="Phase 1 epochs (frozen backbone; head training)")
+    p.add_argument("--ft-epochs", type=int, default=20,
+                   help="Phase 2 epochs (partial unfreeze; fine-tuning)")
+    p.add_argument("--ft-lr", type=float, default=1e-4,
+                   help="Phase 2 learning rate (fine-tuning)")
+    p.add_argument("--unfreeze-last", type=int, default=40,
+                   help="How many backbone layers to unfreeze in phase 2 (BatchNorm stays frozen)")
 
     p.add_argument("--model-out", type=str, default="model.keras", help="Path to save best model")
 
@@ -148,17 +167,23 @@ def make_splits(
     if channels == 3:
         X = np.repeat(X, 3, axis=-1)                        # (N,H,W,3)
 
-    # Train/test split (stratified)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, stratify=y
     )
 
-    # Train/val split from train (stratified)
     X_train, X_val, y_train, y_val = train_test_split(
         X_train, y_train, test_size=val_size, random_state=seed, stratify=y_train
     )
 
     return (X_train, y_train), (X_val, y_val), (X_test, y_test)
+
+
+def compile_binary(model: keras.Model, lr: float) -> None:
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr),
+        loss="binary_crossentropy",
+        metrics=["accuracy", keras.metrics.AUC(name="auc")],
+    )
 
 
 def build_model_custom(img_h: int, img_w: int, lr: float, augment: bool) -> keras.Model:
@@ -185,16 +210,20 @@ def build_model_custom(img_h: int, img_w: int, lr: float, augment: bool) -> kera
     outputs = L.Dense(1, activation="sigmoid")(x)
 
     model = keras.Model(inputs, outputs, name="custom_cnn")
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss="binary_crossentropy",
-        metrics=["accuracy", keras.metrics.AUC(name="auc")],
-    )
+    compile_binary(model, lr)
     return model
 
 
-def build_model_mobilenetv2(img_h: int, img_w: int, lr: float, weights: str, augment: bool) -> keras.Model:
+def build_model_mobilenetv2(
+    img_h: int,
+    img_w: int,
+    lr: float,
+    weights: str,
+    augment: bool,
+) -> Tuple[keras.Model, keras.Model]:
+    """
+    Returns: (full_model, backbone_model)
+    """
     L = keras.layers
 
     aug = keras.Sequential([
@@ -212,38 +241,47 @@ def build_model_mobilenetv2(img_h: int, img_w: int, lr: float, weights: str, aug
     if aug is not None:
         x = aug(x)
 
-    base = keras.applications.MobileNetV2(
+    backbone = keras.applications.MobileNetV2(
         include_top=False,
         weights=(None if weights == "none" else "imagenet"),
         input_shape=(img_h, img_w, 3),
         pooling="avg",
     )
-    base.trainable = False  # start frozen 
+    backbone.trainable = False  # phase 1: frozen
 
-    x = base(x)
+    x = backbone(x)
     x = L.Dropout(0.35)(x)
     outputs = L.Dense(1, activation="sigmoid")(x)
 
     model = keras.Model(inputs, outputs, name="mobilenetv2_head")
+    compile_binary(model, lr)
+    return model, backbone
 
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss="binary_crossentropy",
-        metrics=["accuracy", keras.metrics.AUC(name="auc")],
-    )
-    return model
+
+def unfreeze_backbone_for_finetune(
+    backbone: keras.Model,
+    unfreeze_last: int,
+) -> None:
+    """
+    Unfreeze last N layers of backbone for fine-tuning, but keep BatchNorm layers frozen.
+    """
+    backbone.trainable = True
+
+    if unfreeze_last is not None and unfreeze_last > 0:
+        for layer in backbone.layers[:-unfreeze_last]:
+            layer.trainable = False
+
+    # Always freeze BatchNorm for small datasets (stability)
+    for layer in backbone.layers:
+        if isinstance(layer, keras.layers.BatchNormalization):
+            layer.trainable = False
 
 
 def pick_threshold(y_true: np.ndarray, probs: np.ndarray) -> float:
-    """
-    Pick threshold maximizing balanced accuracy on validation set.
-    Skips degenerate thresholds that predict a single class for all samples.
-    Falls back to 0.5 if the model can't separate classes on validation.
-    """
     best_t, best_score = 0.5, -1.0
     for t in np.linspace(0.05, 0.95, 181):
         preds = (probs >= t).astype(int)
-        if preds.min() == preds.max():  # all 0s or all 1s
+        if preds.min() == preds.max():
             continue
         score = balanced_accuracy_score(y_true, preds)
         if score > best_score:
@@ -272,6 +310,16 @@ def plot_and_maybe_save_or_show(fig_name: str, save_plots: bool):
         plt.show()
 
 
+def merge_histories(h1: keras.callbacks.History, h2: Optional[keras.callbacks.History]) -> Dict[str, List[float]]:
+    merged = {k: list(v) for k, v in h1.history.items()}
+    if h2 is None:
+        return merged
+    for k, v in h2.history.items():
+        merged.setdefault(k, [])
+        merged[k].extend(list(v))
+    return merged
+
+
 def main():
     args = parse_args()
 
@@ -282,7 +330,6 @@ def main():
 
     channels = 1 if args.backbone == "custom" else 3
     if args.backbone != "custom":
-        # If user left defaults (135x240), auto bump to a standard TL size.
         if (args.img_h, args.img_w) == (135, 240):
             args.img_h, args.img_w = 224, 224
             print("NOTE: --backbone mobilenetv2 detected; auto-setting --img-h/--img-w to 224x224.")
@@ -300,41 +347,89 @@ def main():
     print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
     print(f"Pos rate (train): {y_train.mean():.3f} | (val): {y_val.mean():.3f} | (test): {y_test.mean():.3f}")
 
+    backbone = None
     if args.backbone == "custom":
         model = build_model_custom(args.img_h, args.img_w, args.lr, augment=args.augment)
     else:
-        model = build_model_mobilenetv2(args.img_h, args.img_w, args.lr,
-                                        weights=args.backbone_weights, augment=args.augment)
+        model, backbone = build_model_mobilenetv2(
+            args.img_h, args.img_w, args.lr,
+            weights=args.backbone_weights,
+            augment=args.augment,
+        )
 
     model.summary()
-
-    callbacks = [
-        keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=7, restore_best_weights=True),
-        keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
-    ]
 
     class_weight = None
     if args.use_class_weights:
         class_weight = compute_class_weights(y_train)
         print(f"Using class weights: {class_weight}")
 
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        callbacks=callbacks,
-        class_weight=class_weight,
-        verbose=1,
-    )
+    # -------------------------
+    # Training (single-stage OR two-phase)
+    # -------------------------
+    history2 = None
 
+    if args.fine_tune and args.backbone == "mobilenetv2":
+        # Phase 1: head training (frozen backbone)
+        callbacks1 = [
+            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=6, restore_best_weights=True),
+            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
+        ]
+        print(f"\n[Phase 1] Frozen backbone head training: epochs={args.head_epochs}, lr={args.lr}")
+        history1 = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=args.head_epochs,
+            batch_size=args.batch_size,
+            callbacks=callbacks1,
+            class_weight=class_weight,
+            verbose=1,
+        )
+
+        # Phase 2: fine-tuning (partial unfreeze + lower LR)
+        assert backbone is not None
+        unfreeze_backbone_for_finetune(backbone, args.unfreeze_last)
+        compile_binary(model, args.ft_lr)
+
+        callbacks2 = [
+            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=5, restore_best_weights=True),
+            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
+        ]
+        print(f"\n[Phase 2] Fine-tune: epochs={args.ft_epochs}, ft_lr={args.ft_lr}, unfreeze_last={args.unfreeze_last}")
+        history2 = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=args.ft_epochs,
+            batch_size=args.batch_size,
+            callbacks=callbacks2,
+            class_weight=class_weight,
+            verbose=1,
+        )
+        history = type("MergedHistory", (), {"history": merge_histories(history1, history2)})()
+    else:
+        callbacks = [
+            keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=7, restore_best_weights=True),
+            keras.callbacks.ModelCheckpoint(args.model_out, monitor="val_auc", mode="max", save_best_only=True),
+        ]
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            callbacks=callbacks,
+            class_weight=class_weight,
+            verbose=1,
+        )
+
+    # -------------------------
+    # Evaluation
+    # -------------------------
     test_loss, test_acc, test_auc = model.evaluate(X_test, y_test, verbose=0)
     print(f"\nTest loss: {test_loss:.4f}")
     print(f"Test acc : {test_acc:.4f}")
     print(f"Test auc : {test_auc:.4f}")
     print(f"Saved best model to: {Path(args.model_out).resolve()}")
 
-    # --- Threshold selection (val) or user provided ---
     val_probs = model.predict(X_val, verbose=0).reshape(-1)
     print("\nVal prob stats:", f"min={val_probs.min():.3f} mean={val_probs.mean():.3f} max={val_probs.max():.3f}")
 
@@ -345,7 +440,6 @@ def main():
         thr = float(args.threshold)
         print(f"Using user threshold: {thr:.2f}")
 
-    # --- Confusion matrices at BOTH thresholds ---
     val_preds_05 = (val_probs >= 0.5).astype(int)
     val_preds_thr = (val_probs >= thr).astype(int)
 
@@ -368,7 +462,7 @@ def main():
     print(f"\nClassification Report @{thr:.2f}:")
     print(classification_report(y_test.astype(int), test_preds_thr, digits=4, zero_division=0))
 
-    # --- ROC + PR curves on TEST ---
+    # ROC + PR curves on TEST
     try:
         roc_auc = roc_auc_score(y_test.astype(int), test_probs)
         ap = average_precision_score(y_test.astype(int), test_probs)
@@ -396,11 +490,13 @@ def main():
     except Exception as e:
         print(f"WARNING: ROC/PR plotting failed: {e}")
 
-    # --- Training curves ---
+    # Training curves
     if args.plots or args.save_plots:
+        h = history.history
+
         plt.figure()
-        plt.plot(history.history["accuracy"], label="train")
-        plt.plot(history.history["val_accuracy"], label="val")
+        plt.plot(h.get("accuracy", []), label="train")
+        plt.plot(h.get("val_accuracy", []), label="val")
         plt.title("Accuracy")
         plt.xlabel("epoch")
         plt.ylabel("accuracy")
@@ -408,8 +504,8 @@ def main():
         plot_and_maybe_save_or_show("accuracy.png", args.save_plots)
 
         plt.figure()
-        plt.plot(history.history["auc"], label="train")
-        plt.plot(history.history["val_auc"], label="val")
+        plt.plot(h.get("auc", []), label="train")
+        plt.plot(h.get("val_auc", []), label="val")
         plt.title("AUC")
         plt.xlabel("epoch")
         plt.ylabel("auc")
@@ -417,8 +513,8 @@ def main():
         plot_and_maybe_save_or_show("auc.png", args.save_plots)
 
         plt.figure()
-        plt.plot(history.history["loss"], label="train")
-        plt.plot(history.history["val_loss"], label="val")
+        plt.plot(h.get("loss", []), label="train")
+        plt.plot(h.get("val_loss", []), label="val")
         plt.title("Loss")
         plt.xlabel("epoch")
         plt.ylabel("loss")
